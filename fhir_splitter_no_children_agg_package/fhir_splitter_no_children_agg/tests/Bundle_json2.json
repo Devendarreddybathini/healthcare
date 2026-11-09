@@ -1,0 +1,56 @@
+{
+  "resourceType": "Bundle",
+  "id": "bundle-test-2",
+  "type": "collection",
+  "entry": [
+    {
+      "fullUrl": "https://example.test/fhir/Patient/patient-200",
+      "resource": {
+        "resourceType": "Patient",
+        "id": "patient-200",
+        "active": true,
+        "identifier": [
+          {
+            "system": "https://example.test/mrn",
+            "value": "TEST-200"
+          }
+        ],
+        "name": [
+          {
+            "use": "official",
+            "family": "Sample",
+            "given": ["Taylor"]
+          }
+        ],
+        "gender": "unknown"
+      }
+    },
+    {
+      "fullUrl": "https://example.test/fhir/Observation/observation-200",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "observation-200",
+        "status": "final",
+        "code": {
+          "coding": [
+            {
+              "system": "https://example.test/codes",
+              "code": "TEST-GLUCOSE",
+              "display": "Test glucose observation"
+            }
+          ],
+          "text": "Synthetic test observation"
+        },
+        "subject": {
+          "reference": "Patient/patient-200"
+        },
+        "valueQuantity": {
+          "value": 5.4,
+          "unit": "mmol/L",
+          "system": "http://unitsofmeasure.org",
+          "code": "mmol/L"
+        }
+      }
+    }
+  ]
+}

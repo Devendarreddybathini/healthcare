@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Multi‑resource JSON → Parent / Children (Python in your browser)</title>
+  <style>
+    :root{--bg:#0b1020;--ink:#e5e7eb;--muted:#94a3b8;--accent:#22c55e}
+    body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.35 system-ui,Segoe UI,Roboto,Arial}
+    .wrap{max-width:1200px;margin:24px auto;padding:0 16px}
+    .h1{font-size:22px;font-weight:800;margin:0 0 8px}
+    .sub{color:var(--muted);margin:0 0 20px}
+    .card{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);border-radius:14px;padding:14px}
+    .toolbar{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+    .btn{background:var(--accent);color:#06121c;border:none;border-radius:10px;padding:9px 14px;font-weight:800;cursor:pointer}
+    .btn.secondary{background:rgba(255,255,255,.08);color:var(--ink)}
+    input[type="file"]{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:8px;color:var(--ink);padding:8px}
+    .muted{color:var(--muted)}
+    .rt-block{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:12px;padding:14px;margin:14px 0}
+    .rt-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px}
+    .rt-title{font-weight:900;font-size:20px}
+    .mono{font-family: ui-monospace,Menlo,Consolas,monospace}
+    .files>div{margin:4px 0}
+  </style>
+  <script defer src="https://cdn.jsdelivr.net/pyodide/v0.26.1/full/pyodide.js"></script>
+  <script>
+
+let pyodide = null;
+let lastFileMap = null; // Store the file map instead of zip bytes
+
+async function ensurePyodide() {
+  if (pyodide) return pyodide;
+  pyodide = await loadPyodide({ indexURL: "https://cdn.jsdelivr.net/pyodide/v0.26.1/full/" });
+  const code = document.getElementById('py-splitter').textContent;
+  pyodide.FS.writeFile('splitter.py', code, { encoding: 'utf8' });
+  await pyodide.runPythonAsync('import importlib, sys; sys.path.append("."); splitter = importlib.import_module("splitter")');
+  document.getElementById('status').textContent = 'Ready';
+  return pyodide;
+}
+
+async function analyzeFile(file) {
+  await ensurePyodide();
+  const text = await file.text();
+  const py = `
+import json, csv, io
+from splitter import collect_resources_except_bundle, group_by_resource_type, ui_mapping, build_file_map
+data = json.loads(js_text)
+resources = collect_resources_except_bundle(data, [])
+grouped = group_by_resource_type(resources)
+_mapping = ui_mapping(grouped)
+_file_map = build_file_map(grouped)
+`;
+  pyodide.globals.set("js_text", text);
+  await pyodide.runPythonAsync(py);
+  const mapping = pyodide.globals.get("_mapping").toJs({ dict_converter: Object.fromEntries });
+  const fileMap = pyodide.globals.get("_file_map").toJs({ dict_converter: Object.fromEntries });
+  pyodide.globals.delete("js_text"); pyodide.globals.delete("_mapping"); pyodide.globals.delete("_file_map");
+  return { mapping, fileMap };
+}
+
+function renderSummary(map) {
+  const results = document.getElementById('results');
+  results.innerHTML = '';
+  const types = Object.keys(map || {});
+  if (!types.length) {
+    results.innerHTML = '<div class="muted">No non‑Bundle resources found.</div>';
+    return;
+  }
+  types.forEach(rt => {
+    const block = document.createElement('div'); block.className = 'rt-block';
+    const header = document.createElement('div'); header.className = 'rt-header';
+    header.innerHTML = `<div class="rt-title">${rt}</div>`; block.appendChild(header);
+
+    const files = document.createElement('div'); files.className = 'files mono';
+    const parentRow = document.createElement('div'); parentRow.textContent = `Parent file: Output/${rt}/parent.data / parent.csv / parent.log`; files.appendChild(parentRow);
+    const cHeader = document.createElement('div'); cHeader.textContent = 'Children file:'; files.appendChild(cHeader);
+    (map[rt].children_files || []).forEach(p => { const row = document.createElement('div'); row.textContent = ` - ${p}`; files.appendChild(row); });
+    const namesRow = document.createElement('div'); namesRow.textContent = `Child tables (${map[rt].child_tables.length}): ${map[rt].child_tables.join(', ')}`; files.appendChild(namesRow);
+    block.appendChild(files); results.appendChild(block);
+  });
+}
+
+async function saveFilesToPickedDirectory(fileMap) {
+  if (!fileMap) { return; }
+  document.getElementById('status').textContent = 'Requesting folder access...';
+  // Request a directory from the user (Edge/Chrome)
+  let dirHandle;
+  try {
+    // NOTE: This API (window.showDirectoryPicker) requires a secure context (HTTPS) or localhost
+    dirHandle = await window.showDirectoryPicker({ id: 'exl_output_dir', mode: 'readwrite' });
+  } catch (e) {
+    document.getElementById('err').textContent = 'Folder selection was cancelled or blocked. The browser must support File System Access API (Chrome/Edge).';
+    document.getElementById('status').textContent = 'Ready';
+    throw e;
+  }
+  document.getElementById('status').textContent = 'Writing files...';
+  let filesWritten = 0;
+  // Recursively create subfolders and write files
+  async function ensureSubdir(baseHandle, parts) {
+    let cur = baseHandle;
+    for (const p of parts) {
+      cur = await cur.getDirectoryHandle(p, { create: true });
+    }
+    return cur;
+  }
+  
+  try {
+    for (const [relPath, content] of Object.entries(fileMap)) {
+      const parts = relPath.split('/');
+      const fname = parts.pop();
+      const subdir = await ensureSubdir(dirHandle, parts);
+      const fileHandle = await subdir.getFileHandle(fname, { create: true });
+      const writable = await fileHandle.createWritable();
+      await writable.write(content);
+      await writable.close();
+      filesWritten++;
+    }
+    document.getElementById('status').textContent = `Success: Wrote ${filesWritten} files to chosen folder.`;
+  } catch(e) {
+    document.getElementById('err').textContent = `Failed to write files after selecting folder: ${e.message}`;
+    document.getElementById('status').textContent = 'Error';
+    console.error(e);
+  }
+  return true;
+}
+
+window.addEventListener('DOMContentLoaded', () => {
+  const fileEl = document.getElementById('file');
+  const runBtn = document.getElementById('run');
+  const chooseDirBtn = document.getElementById('choose-dir');
+  const dlBtn = document.getElementById('download-all'); // Kept, but disabled by default now
+  const statusEl = document.getElementById('status');
+  const errEl = document.getElementById('err');
+  
+  // Initially disable the save buttons
+  chooseDirBtn.disabled = true;
+  dlBtn.disabled = true;
+
+  runBtn.addEventListener('click', async () => {
+    const f = fileEl.files[0];
+    if (!f) { errEl.textContent = 'Choose a JSON file first.'; return; }
+    errEl.textContent = ''; statusEl.textContent = 'Running…';
+    chooseDirBtn.disabled = true;
+    dlBtn.disabled = true;
+    try {
+      const { mapping, fileMap } = await analyzeFile(f);
+      renderSummary(mapping);
+      lastFileMap = fileMap;
+      
+      // Enable the folder picker after successful analysis
+      chooseDirBtn.disabled = false;
+      statusEl.textContent = 'Ready to save files.';
+      
+      // Note: The ZIP download option is still disabled as the default is now folder-picker.
+    } catch (e) {
+      console.error(e); errEl.textContent = 'Failed to analyze. See console for details.'; statusEl.textContent = 'Error';
+    }
+  });
+
+  chooseDirBtn.addEventListener('click', async () => {
+    errEl.textContent = '';
+    chooseDirBtn.disabled = true;
+    try {
+        await saveFilesToPickedDirectory(lastFileMap);
+    } catch (e) {
+        // Handled inside saveFilesToPickedDirectory, but ensure button is re-enabled on failure
+        console.error(e);
+    } finally {
+        chooseDirBtn.disabled = false;
+    }
+  });
+
+  // The original ZIP download button listener is kept but not used in the new flow
+  dlBtn.addEventListener('click', () => {
+    // This code is now non-functional as Python no longer returns a zip, but is kept for completeness
+    alert("ZIP download is disabled. Please use 'Choose Output Base Folder'.");
+  });
+
+  ensurePyodide().catch(err => { console.error(err); statusEl.textContent = 'Pyodide failed to load'; });
+});
+
+</script>
+  <script id="py-splitter" type="text/plain">
+from __future__ import annotations
+import json, io, zipfile, csv
+from typing import Any, Dict, List, Tuple
+
+def _to_pascal(name: str) -> str:
+    parts = [p for p in str(name).replace('-', '_').split('_') if p]
+    return "_".join(p[:1].upper() + p[1:] for p in parts)
+
+def _normalize_child_basename(resource: str, child_key: str) -> str:
+    prefix = (resource + "_").lower()
+    n = str(child_key)
+    if n.lower().startswith(prefix):
+        n = n[len(prefix):]
+    return f"{resource}_{_to_pascal(n)}"
+
+def _normalize_child_filename(resource: str, child_key: str) -> str:
+    return f"Output/{resource}/{_normalize_child_basename(resource, child_key)}.data"
+
+def split_parent_children(obj: Dict[str, Any]) -> Dict[str, Any]:
+    res_type = obj.get("resourceType", "Unknown")
+    id_val = obj.get("id"); mv = None
+    meta = obj.get("meta")
+    if isinstance(meta, dict):
+        mv = meta.get("versionid") or meta.get("versionId")
+    parent_row: Dict[str, Any] = {"resourceType": res_type}
+    if id_val is not None: parent_row["id"] = id_val
+    if mv is not None: parent_row["meta_versionid"] = mv
+    parent_row["__snapshot"] = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+    children: Dict[str, List[Dict[str, Any]]] = {}
+    def ensure(name: str) -> List[Dict[str, Any]]:
+        if name not in children: children[name] = []
+        return children[name]
+    def flatten(node: Any, prefix: tuple, out: Dict[str, Any]):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                keyp = prefix + (k,)
+                if isinstance(v, list):
+                    out["_".join(keyp)] = json.dumps(v, ensure_ascii=False)
+                elif isinstance(v, dict):
+                    flatten(v, keyp, out)
+                else:
+                    out["_".join(keyp)] = v
+        return out
+    def emit(items, path: tuple):
+        table = "_".join(path); rows = ensure(table)
+        for it in items:
+            row: Dict[str, Any] = {}
+            if id_val is not None: row["id"] = id_val
+            if mv is not None: row["meta_versionid"] = mv
+            if isinstance(it, dict):
+                for k, v in it.items():
+                    keyp = path + (k,)
+                    if isinstance(v, list):
+                        row["_".join(keyp)] = json.dumps(v, ensure_ascii=False)
+                    elif isinstance(v, dict):
+                        row.update(flatten(v, keyp, {}))
+                    else:
+                        row["_".join(keyp)] = v
+            else:
+                row["_".join(path)] = it
+            rows.append(row)
+    def walk(node, path: tuple = ()):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                keyp = path + (k,)
+                if isinstance(v, list): emit(v, keyp)
+                elif isinstance(v, dict): parent_row.update(flatten(v, keyp, {}))
+                else: parent_row["_".join(keyp)] = v
+        elif isinstance(node, list): emit(node, path)
+    payload = {k: v for k, v in obj.items() if k not in ("id","versionid","resourceType","meta")}
+    walk(payload)
+    return {"parent": [parent_row], "children": children}
+
+def collect_resources_except_bundle(obj: Any, out: List[Dict[str, Any]] | None = None) -> List[Dict[str, Any]]:
+    if out is None: out = []
+    if isinstance(obj, dict):
+        if obj.get("resourceType") == "Bundle":
+            for e in obj.get("entry", []):
+                if isinstance(e, dict) and "resource" in e:
+                    collect_resources_except_bundle(e["resource"], out)
+        elif "resourceType" in obj and obj.get("resourceType") != "Bundle":
+            out.append(obj)
+        else:
+            for v in obj.values():
+                collect_resources_except_bundle(v, out)
+    elif isinstance(obj, list):
+        for item in obj: collect_resources_except_bundle(item, out)
+    return out
+
+def group_by_resource_type(objs: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    grouped: Dict[str, Dict[str, Any]] = {}
+    for r in objs:
+        rt = r.get("resourceType", "Unknown")
+        res = split_parent_children(r)
+        g = grouped.setdefault(rt, {"parent": [], "children": {}})
+        g["parent"].extend(res.get("parent") or [])
+        for k, rows in (res.get("children") or {}).items():
+            g["children"].setdefault(k, []).extend(rows)
+    return grouped
+
+def ui_mapping(by_type: Dict[str, Dict[str, Any]]):
+    out = {}
+    for rt, data in by_type.items():
+        child_keys = list((data.get("children") or {}).keys())
+        child_files = [_normalize_child_filename(rt, k) for k in child_keys]
+        child_tables = [_normalize_child_basename(rt, k) for k in child_keys]
+        out[rt] = {
+            "parent_label": f"Output/{rt}/parent.data / parent.csv / parent.log",
+            "children_files": child_files,
+            "child_tables": child_tables,
+        }
+    return out
+
+def _list_to_csv_text(rows):
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    if isinstance(rows, list) and rows:
+        if isinstance(rows[0], dict):
+            headers = list(rows[0].keys())
+            writer.writerow(headers)
+            for r in rows:
+                writer.writerow([r.get(h, "") for h in headers])
+        else:
+            for r in rows:
+                writer.writerow([r])
+    elif isinstance(rows, dict):
+        headers = list(rows.keys())
+        writer.writerow(headers)
+        writer.writerow([rows.get(h, "") for h in headers])
+    return buf.getvalue()
+
+def build_file_map(by_type: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
+    file_map: Dict[str, str] = {}
+    for rt, data in by_type.items():
+        parent_rows = data.get("parent") or []
+        parent_txt = json.dumps(parent_rows, ensure_ascii=False, indent=2)
+        parent_csv = _list_to_csv_text(parent_rows)
+        # Write .data, .csv, and .log files for parent
+        file_map[f"Output/{rt}/parent.data"] = parent_txt
+        file_map[f"Output/{rt}/parent.csv"] = parent_csv
+        file_map[f"Output/{rt}/parent.log"] = parent_txt
+
+        for child_key, rows in (data.get("children") or {}).items():
+            base = _normalize_child_basename(rt, child_key)
+            rows_txt = json.dumps(rows or [], ensure_ascii=False, indent=2)
+            rows_csv = _list_to_csv_text(rows or [])
+            # Write .data, .csv, and .log files for children
+            file_map[f"Output/{rt}/{base}.data"] = rows_txt
+            file_map[f"Output/{rt}/{base}.csv"] = rows_csv
+            file_map[f"Output/{rt}/{base}.log"] = rows_txt
+    return file_map
+</script>
+</head>
+<body>
+  <div class="wrap">
+    <div class="h1">Multi‑resource JSON → Parent / Children (Python in your browser)</div>
+    <p class="sub">
+      • <strong>Ignores</strong> <span class="mono">resourceType: Bundle</span> wrapper fields and extracts the resources inside.<br>
+      • Processes all non‑Bundle resources and renders a <em>summary only</em>: <em>table names</em> and <em>file names</em> (no raw data shown).<br>
+      • Creates an <span class="mono">Output</span>/ folder and a subfolder per resource type; saves <span class="mono">parent.data / parent.csv / parent.log</span> and per‑child files.
+    </p>
+
+    <div class="card">
+      <h2>1) Upload & Save</h2>
+      <div class="toolbar">
+        <input id="file" type="file" accept="application/json,.data" />
+        <button id="choose-dir" class="btn">Choose Output Base Folder</button>
+        <span class="muted">Output base: Tool</span>
+        <button id="run" class="btn">Run</button>
+        <span id="status" class="muted">Pyodide loading…</span>
+      </div>
+      <div class="toolbar" style="margin-top:8px">
+        <button id="download-all" class="btn secondary" disabled>Download All Output (ZIP)</button>
+      </div>
+      <div id="err" style="color:#fca5a5"></div>
+    </div>
+
+    <div id="results"></div>
+  </div>
+
+</body>
+</html>

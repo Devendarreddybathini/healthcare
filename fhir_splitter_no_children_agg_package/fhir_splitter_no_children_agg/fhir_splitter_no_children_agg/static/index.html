@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Multi‑resource JSON → Parent / Children (local)</title>
+  <style>
+    :root{--bg:#0b1020;--ink:#e5e7eb;--muted:#94a3b8;--accent:#22c55e}
+    body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.35 system-ui,Segoe UI,Roboto,Arial}
+    .wrap{max-width:1200px;margin:24px auto;padding:0 16px}
+    .h1{font-size:22px;font-weight:800;margin:0 0 8px}
+    .sub{color:var(--muted);margin:0 0 20px}
+    .card{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);border-radius:14px;padding:14px}
+    .toolbar{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+    .btn{background:var(--accent);color:#06121c;border:none;border-radius:10px;padding:9px 14px;font-weight:800;cursor:pointer}
+    .btn.secondary{background:rgba(255,255,255,.08);color:var(--ink)}
+    input[type="file"]{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:8px;color:var(--ink);padding:8px}
+    .muted{color:var(--muted)}
+    .success{color:#86efac;font-weight:700}
+    .rt-block{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:12px;padding:14px;margin:14px 0}
+    .rt-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px}
+    .rt-title{font-weight:900;font-size:20px}
+    .mono{font-family: ui-monospace,Menlo,Consolas,monospace}
+    .files>div{margin:4px 0}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="h1">FHIR Bundle Parent / Child Export</div>
+    <p class="sub">
+      Select one or more JSON files, or a folder of JSON files. Bundle resources are grouped by FHIR resource type.<br>
+      Save the resulting parent and child rows to MySQL, or download them as JSON files in a ZIP.
+    </p>
+
+    <div class="card">
+      <h2>1) Select & Save</h2>
+      <div class="toolbar">
+        <label for="file">JSON files</label>
+        <input id="file" type="file" accept="application/json,.json" multiple />
+        <label for="folder">JSON folder</label>
+        <input id="folder" type="file" accept="application/json,.json" webkitdirectory directory multiple />
+        <button id="run" class="btn">Run</button>
+        <span id="status" class="muted">Ready</span>
+      </div>
+      <div class="toolbar" style="margin-top:8px">
+        <button id="save-mysql" class="btn" disabled>Save to MySQL</button>
+        <button id="download-all" class="btn secondary" disabled>Download All Output</button>
+      </div>
+      <div id="err" style="color:#fca5a5"></div>
+    </div>
+
+    <div id="results"></div>
+  </div>
+
+  <script>
+    const fileInput = document.getElementById('file');
+    const folderInput = document.getElementById('folder');
+    const runBtn = document.getElementById('run');
+    const dlBtn = document.getElementById('download-all');
+    const saveBtn = document.getElementById('save-mysql');
+    const statusEl = document.getElementById('status');
+    const errEl = document.getElementById('err');
+    const results = document.getElementById('results');
+    let analyzedFiles = [];
+
+    function selectedFiles(){
+      const selected = fileInput.files.length ? fileInput.files : folderInput.files;
+      return Array.from(selected).filter(file => file.name.toLowerCase().endsWith('.json'));
+    }
+
+    function makeFormData(files){
+      const formData = new FormData();
+      files.forEach(file => formData.append('files', file, file.webkitRelativePath || file.name));
+      return formData;
+    }
+
+    function resetAnalysis(){
+      analyzedFiles = [];
+      saveBtn.disabled = true;
+      dlBtn.disabled = true;
+      results.innerHTML = '';
+    }
+
+    function render(map){
+      results.innerHTML = '';
+      const types = Object.keys(map || {});
+      if (!types.length){ results.innerHTML = '<div class="muted">No non‑Bundle resources found.</div>'; return; }
+      types.forEach(rt => {
+        const block = document.createElement('div'); block.className='rt-block';
+        const header = document.createElement('div'); header.className='rt-header';
+        header.innerHTML = `<div class="rt-title">${rt}</div>`; block.appendChild(header);
+
+        const files = document.createElement('div'); files.className='files mono';
+        const p = document.createElement('div'); p.textContent = `Parent file: Output/${rt}/parent.json`; files.appendChild(p);
+
+        const cHeader = document.createElement('div'); cHeader.textContent = 'Children file:'; files.appendChild(cHeader);
+        (map[rt].children_files || []).forEach(f => {
+          const row = document.createElement('div'); row.textContent = ` - ${f}`; files.appendChild(row);
+        });
+
+        const names = document.createElement('div');
+        names.textContent = `Child tables (${map[rt].child_tables.length}): ${map[rt].child_tables.join(', ')}`;
+        files.appendChild(names);
+        block.appendChild(files);
+        results.appendChild(block);
+      });
+    }
+
+    async function analyze(){
+      const files = selectedFiles();
+      if (!files.length){ errEl.textContent='Choose JSON files or a folder containing JSON files.'; return; }
+      errEl.textContent=''; statusEl.textContent=`Analyzing ${files.length} file(s)…`;
+      resetAnalysis();
+      try {
+        const res = await fetch('/analyze-batch', { method:'POST', body: makeFormData(files) });
+        const result = await res.json();
+        if (!res.ok) throw new Error(result.detail || 'Analyze failed.');
+        render(result);
+        analyzedFiles = files;
+        saveBtn.disabled = false;
+        dlBtn.disabled = false;
+        statusEl.textContent=`Ready: ${files.length} file(s) analyzed`;
+      } catch (error) {
+        statusEl.textContent='Error';
+        errEl.textContent=error.message || 'Analyze failed.';
+      }
+    }
+
+    async function downloadAll(){
+      errEl.textContent=''; statusEl.textContent='Packaging…';
+      try {
+        const res = await fetch('/download-batch', { method:'POST', body: makeFormData(analyzedFiles) });
+        if (!res.ok) {
+          const result = await res.json();
+          throw new Error(result.detail || 'Download failed.');
+        }
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a'); a.href = url; a.download = 'Output.zip'; a.click();
+        URL.revokeObjectURL(url);
+        statusEl.textContent='ZIP downloaded';
+      } catch (error) {
+        statusEl.textContent='Error';
+        errEl.textContent=error.message || 'Download failed.';
+      }
+    }
+
+    async function saveToMySQL(){
+      errEl.textContent=''; statusEl.className='muted'; statusEl.textContent='Saving to MySQL…';
+      try {
+        const res = await fetch('/save-to-mysql', { method:'POST', body: makeFormData(analyzedFiles) });
+        const result = await res.json();
+        if (!res.ok) throw new Error(result.detail || 'Database save failed.');
+        statusEl.className='success';
+        statusEl.textContent=`Database saved: ${result.rows_inserted} inserted, ${result.rows_updated} updated, ${result.rows_unchanged} unchanged.`;
+      } catch (error) {
+        statusEl.className='muted';
+        statusEl.textContent='Error';
+        errEl.textContent=error.message || 'Database save failed.';
+      }
+    }
+
+    runBtn.addEventListener('click', analyze);
+    dlBtn.addEventListener('click', downloadAll);
+    saveBtn.addEventListener('click', saveToMySQL);
+    fileInput.addEventListener('change', () => { folderInput.value=''; resetAnalysis(); });
+    folderInput.addEventListener('change', () => { fileInput.value=''; resetAnalysis(); });
+  </script>
+</body>
+</html>
